@@ -195,6 +195,26 @@ class TestLunoExchange(unittest.TestCase):
             "status": "ACTIVE"
         }
 
+    def get_trades_response(self) -> Dict:
+        return {
+            "trades": [
+                {
+                    "price": "0.3003",
+                    "sequence": 12345,
+                    "is_buy": True,
+                    "volume": "1.5",
+                    "timestamp": 1630556205455
+                },
+                {
+                    "price": "0.3002",
+                    "sequence": 12344,
+                    "is_buy": False,
+                    "volume": "0.5",
+                    "timestamp": 1630556105455
+                }
+            ]
+        }
+
     @aioresponses()
     def test_all_trading_pairs(self, mock_api):
         url = f"{CONSTANTS.REST_URL}{CONSTANTS.MARKETS_INFO_URL}"
@@ -561,9 +581,9 @@ class TestLunoExchange(unittest.TestCase):
 
     @aioresponses()
     def test_get_last_traded_price(self, mock_api):
-        url = f"{CONSTANTS.REST_URL}{CONSTANTS.TICKER_URL}"
+        url = f"{CONSTANTS.REST_URL}{CONSTANTS.TRADES_URL}"
         regex_url = re.compile(f"^{url}")
-        mock_api.get(regex_url, body=json.dumps(self.get_ticker_response()))
+        mock_api.get(regex_url, body=json.dumps(self.get_trades_response()))
 
         price = self.async_run_with_timeout(
             self.exchange._get_last_traded_price(self.trading_pair)

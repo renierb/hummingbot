@@ -1,522 +1,364 @@
+import logging
 import threading
-import time
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
 
 from sortedcontainers import SortedDict
 
-# Use Hummingbot's specific types where available
 from hummingbot.core.data_type.common import TradeType
-from hummingbot.core.data_type.order_book import OrderBook  # Base class
-from hummingbot.core.data_type.order_book_message import OrderBookMessage
-from hummingbot.core.data_type.order_book_row import OrderBookRow  # Used by base class iterators
+from hummingbot.core.data_type.order_book import OrderBook, OrderBookRow
 
 
-# Define a custom exception for sequence gaps (can be kept outside the class)
 class SequenceGapError(Exception):
-    """Custom exception for handling sequence gaps in Luno stream."""
+    """Exception raised when a sequence gap is detected in Luno stream."""
 
     def __init__(self, trading_pair: str, expected: int, received: int):
+        super().__init__(f"Sequence gap for {trading_pair}: expected {expected}, received {received}")
         self.trading_pair = trading_pair
         self.expected = expected
         self.received = received
-        super().__init__(
-            f"Sequence gap detected for {trading_pair}: Expected {expected}, received {received}"
-        )
 
 
 class LunoOrderBook(OrderBook):
     """
-    Custom OrderBook implementation for Luno exchange.
+    OrderBook implementation for Luno exchange.
 
-    Manages a detailed, order-ID-based internal state based on Luno's
-    WebSocket stream, which provides individual order data. It updates the
-    base Hummingbot OrderBook state using snapshots derived from this
-    detailed internal state.
-
-    Rationale for Snapshot Updates:
-    Luno's stream provides individual order creation, deletion (by ID), and
-    partial fills (trades affecting maker orders). Generating correct Hummingbot
-    'diff' messages (which require the new total aggregated volume at affected
-    price levels) directly from these granular updates is complex and error-prone,
-    especially for deletions and trades where remaining volume isn't explicitly sent.
-    Therefore, this implementation prioritizes internal state accuracy and updates
-    the base Hummingbot OrderBook via full snapshots whenever the internal state changes,
-    ensuring consistency at the cost of potential performance overhead compared to
-    true diff processing.
+    Maintains a detailed internal state tracking individual orders by ID based on
+    Luno's WebSocket stream. It keeps the internal book trimmed to a defined depth
+    and updates the base Hummingbot OrderBook state using aggregated snapshots
+    derived from this trimmed internal state.
     """
+    _logger = None  # Class logger instance
 
-    # Logger instance should be set by the DataSource/Connector using this class
-    _logger = None
+    # --- Constants ---
+    _DEPTH_LIMIT: int = 100  # Keep only top N price levels per side
+    _DECIMAL_ZERO: Decimal = Decimal("0")
+    _DUST_THRESHOLD: Decimal = Decimal("1e-18")  # Threshold for treating internal volume as zero
+    _HB_DUST_THRESHOLD: Decimal = Decimal("1e-9")  # Hummingbot typical threshold for snapshots
 
-    # Constants
-    _DUST_THRESHOLD_INTERNAL = Decimal("1e-18")  # Tolerance for internal volume checks
-    _DUST_THRESHOLD_HUMMINGBOT = Decimal("1e-9")  # Tolerance for Hummingbot snapshot data
+    @classmethod
+    def logger(cls) -> logging.Logger:
+        """Gets the logger for this class."""
+        if cls._logger is None:
+            cls._logger = logging.getLogger(__name__)
+        return cls._logger
 
     def __init__(self, trading_pair: str):
-        """
-        Initializes the LunoOrderBook.
-        :param trading_pair: The trading pair this order book represents (e.g., "BTC-ZAR").
-        """
+        """Initializes the LunoOrderBook."""
         super().__init__(dex=False)
         self._trading_pair = trading_pair
-        self._bids_internal: SortedDict[Decimal, Dict[str, Decimal]] = SortedDict()
-        self._asks_internal: SortedDict[Decimal, Dict[str, Decimal]] = SortedDict()
-        self._order_id_map: Dict[str, Tuple[Decimal, TradeType]] = {}
+        # Internal detailed state {price: {order_id: volume}}
+        self._bids: SortedDict[Decimal, Dict[str, Decimal]] = SortedDict()
+        self._asks: SortedDict[Decimal, Dict[str, Decimal]] = SortedDict()
+        # Map order_id -> (price, TradeType) for fast lookups
+        self._order_map: Dict[str, Tuple[Decimal, TradeType]] = {}
+        # Luno sequence number
         self._sequence: int = -1
-        self._last_update_timestamp: float = -1.0
+        # Thread lock for state modification
         self._lock = threading.Lock()
-        self._snapshot_uid = -1  # Mirror base class property if needed for checks
-        self._last_diff_uid = -1
 
-    # --- Core Luno Stream Processing Logic ---
-
-    def process_luno_snapshot(self, snapshot_msg: Dict[str, Any]):
+    def process_snapshot(self, snapshot: Dict[str, Any]) -> None:
         """
-        Processes the initial order book snapshot message from Luno's WebSocket.
-        Resets state, populates internal detailed state, and applies a snapshot
-        to the base Hummingbot OrderBook.
+        Processes the initial snapshot message from the Luno WebSocket stream.
 
-        Expected snapshot_msg format:
-        {
-          "sequence": "24352",
-          "asks": [ {"id": "...", "price": "...", "volume": "..."}, ... ],
-          "bids": [ {"id": "...", "price": "...", "volume": "..."}, ... ],
-          "status": "ACTIVE",
-          "timestamp": 1528884331021
-        }
-
-        :param snapshot_msg: The initial book message from Luno stream.
+        :param snapshot: The snapshot data dictionary.
         """
         with self._lock:
+            self.logger().info(f"[{self._trading_pair}] Processing snapshot...")
             try:
-                self._reset_state_internal()  # Reset detailed state
+                self.reset_state()
+                seq = int(snapshot["sequence"])
 
-                # --- Validate and extract critical data FIRST ---
-                sequence = int(snapshot_msg['sequence'])
-                timestamp_ms = snapshot_msg['timestamp']  # Luno uses ms
-                asks_data = snapshot_msg.get('asks', [])
-                bids_data = snapshot_msg.get('bids', [])
+                # --- Set sequence BEFORE potentially failing population ---
+                self._sequence = seq
+                self.logger().debug(f"[{self._trading_pair}] Snapshot sequence set to {seq}.")
 
-                if sequence < 0:
-                    raise ValueError("Invalid initial sequence number.")
+                # --- Populate internal state ---
+                self._load_side(self._bids, snapshot.get("bids", []), TradeType.BUY)
+                self._load_side(self._asks, snapshot.get("asks", []), TradeType.SELL)
 
-                # --- Set sequence and timestamp BEFORE population ---
-                # If population fails partially, sequence is still set correctly
-                self._sequence = sequence
-                self._last_update_timestamp = self._parse_luno_timestamp(timestamp_ms)
-                self.logger().debug(f"[{self._trading_pair}] Processing snapshot seq {self._sequence}...")
+                # --- Trim to depth limit ---
+                self._trim_book()
 
-                # --- Populate internal detailed book ---
-                # Errors during population of individual orders are logged but shouldn't stop the whole process
-                self._populate_side_from_luno(self._asks_internal, asks_data, TradeType.SELL)
-                self._populate_side_from_luno(self._bids_internal, bids_data, TradeType.BUY)
+                self.logger().info(f"[{self._trading_pair}] Internal snapshot loaded & trimmed. "
+                                   f"Bids: {len(self._bids)}, Asks: {len(self._asks)}, Orders: {len(self._order_map)}")
 
-                self.logger().info(f"[{self._trading_pair}] Initial internal book processed. Seq: {self._sequence}, "
-                                   f"Internal Bids: {len(self._bids_internal)} levels ({sum(len(v) for v in self._bids_internal.values())} orders), "
-                                   f"Internal Asks: {len(self._asks_internal)} levels ({sum(len(v) for v in self._asks_internal.values())} orders).")
+                # --- Apply to base class ---
+                self._apply_snapshot_to_base_book(seq)
 
-                # --- Apply snapshot to the base Hummingbot OrderBook ---
-                self._apply_snapshot_to_base_book()
+            except (KeyError, ValueError) as e:
+                self.reset_state()  # Reset on critical failure
+                self.logger().error(f"[{self._trading_pair}] Failed to process snapshot: {e}. State reset.", exc_info=True)
+            except Exception:
+                self.reset_state()  # Reset on critical failure
+                self.logger().exception(f"[{self._trading_pair}] Unexpected error processing snapshot. State reset.")
 
-            except (KeyError, ValueError, TypeError, InvalidOperation) as e:
-                # Catch errors in extracting sequence/timestamp or critical failures
-                self.logger().error(
-                    f"[{self._trading_pair}] CRITICAL Error processing Luno snapshot: {e}. Resetting state. Message: {snapshot_msg}",
-                    exc_info=True
-                )
-                self._reset_state_internal()  # Ensure clean state on critical error
-                self.apply_snapshot([], [], -1)  # Also reset base class state
-            except Exception as e:
-                # Catch any other unexpected critical errors
-                self.logger().error(
-                    f"[{self._trading_pair}] Unexpected CRITICAL error processing Luno snapshot: {e}. Resetting state. Message: {snapshot_msg}",
-                    exc_info=True
-                )
-                self._reset_state_internal()
-                self.apply_snapshot([], [], -1)
-
-    def process_luno_update(self, update_msg: Dict[str, Any]) -> bool:
+    def process_update(self, update: Dict[str, Any]) -> bool:
         """
-        Processes a subsequent update message (create, delete, trade, status) from Luno's WebSocket.
-        Handles sequence checks and updates the internal detailed state.
-        If the internal state changes, applies a new snapshot to the base OrderBook.
+        Processes an incremental update message from the Luno WebSocket stream.
 
-        Expected update_msg format:
-        {
-          "sequence": "24353",
-          "trade_updates": null or [ { "sequence": ..., "base": ..., ... } ],
-          "create_update": null or { "order_id": ..., "type": ..., ... },
-          "delete_update": null or { "order_id": ... },
-          "status_update": null or { "status": ... },
-          "timestamp": 1469031991
-        }
-
-        :param update_msg: The update message from Luno stream.
-        :return: True if the internal book state was changed, False otherwise.
-        :raises: SequenceGapError if a gap is detected.
+        :param update: The update data dictionary.
+        :raises SequenceGapError: If a sequence number gap is detected.
+        :return: True if the update changed the order book state, False otherwise.
         """
-        internal_state_changed = False  # Default return value
+        state_changed = False  # Default return value
         with self._lock:
             try:
-                # Ensure initial snapshot was processed
-                if self._sequence == -1:
-                    self.logger().warning(f"[{self._trading_pair}] Ignoring update, initial snapshot not yet processed: {update_msg}")
-                    return False
-
-                update_sequence = int(update_msg['sequence'])
+                seq = int(update["sequence"])
 
                 # --- Sequence Check ---
-                if update_sequence <= self._sequence:
-                    # self.logger().debug(f"[{self._trading_pair}] Ignoring old update seq {update_sequence} (current: {self._sequence})")
+                if self._sequence == -1:
+                    self.logger().warning(f"[{self._trading_pair}] Update received before snapshot. Ignoring seq {seq}.")
                     return False
 
-                if update_sequence > self._sequence + 1:
+                if seq <= self._sequence:
+                    # self.logger().debug(f"[{self._trading_pair}] Ignoring old sequence {seq} (current {self._sequence}).")
+                    return False
+
+                if seq > self._sequence + 1:
                     expected = self._sequence + 1
-                    self.logger().error(f"[{self._trading_pair}] Sequence gap detected! Expected: {expected}, Received: {update_sequence}.")
-                    raise SequenceGapError(self._trading_pair, expected, update_sequence)
+                    self.logger().error(f"[{self._trading_pair}] Sequence gap detected! Expected: {expected}, Received: {seq}.")
+                    raise SequenceGapError(self._trading_pair, expected, seq)
 
-                # --- Apply Update to Internal State ---
-                # This handles create_update, delete_update, trade_updates
-                internal_state_changed = self._apply_luno_update_internal(update_msg)
+                # --- Apply Updates ---
+                if cu := update.get("create_update"):
+                    state_changed |= self._apply_create(cu)
+                if du := update.get("delete_update"):
+                    state_changed |= self._apply_delete(du)
+                if trade_updates := update.get("trade_updates"):
+                    for tu in trade_updates:
+                        state_changed |= self._apply_trade_update(tu)
 
-                # Process status_update separately (usually doesn't change book structure)
-                self._process_luno_status_update(update_msg)
-                self._sequence = update_sequence  # Update sequence *after* successful application
+                # --- Update Sequence ---
+                self._sequence = seq  # Update only after successful processing
 
-                timestamp_ms = update_msg.get('timestamp')
-                if timestamp_ms:
-                    self._last_update_timestamp = self._parse_luno_timestamp(timestamp_ms)
+                # --- Trim and Apply to Base if Changed ---
+                if state_changed:
+                    # self.logger().debug(f"[{self._trading_pair}] State changed by seq {seq}. Trimming and applying snapshot.")
+                    self._trim_book()
+                    self._apply_snapshot_to_base_book(seq)
 
-                # --- Update Base Hummingbot OrderBook (if changed) ---
-                if internal_state_changed:
-                    self._apply_snapshot_to_base_book()
-                    return True
-                else:
-                    return False
+                return state_changed
 
             except SequenceGapError:
-                # Re-raise sequence gap errors to be handled by the caller (DataSource)
-                raise
-            except (KeyError, ValueError, TypeError, InvalidOperation) as e:
-                # Log errors during update processing but don't crash the loop
-                self.logger().error(
-                    f"[{self._trading_pair}] Error processing Luno update: {e}. Message: {update_msg}",
-                    exc_info=True
-                )
-                return False  # Indicate no change / error occurred
-            except Exception as e:
-                # Catch unexpected errors
-                self.logger().error(
-                    f"[{self._trading_pair}] Unexpected error processing Luno update: {e}. Message: {update_msg}",
-                    exc_info=True
-                )
+                raise  # Propagate gap error
+            except (KeyError, ValueError, InvalidOperation) as e:
+                self.logger().warning(f"[{self._trading_pair}] Error applying update seq {update.get('sequence', 'N/A')}: {e}", exc_info=False)
+                return False  # Indicate error without stopping caller
+            except Exception:
+                self.logger().exception(f"[{self._trading_pair}] Unexpected error processing update seq {update.get('sequence', 'N/A')}.")
                 return False
 
-    # --- Base Class Method Implementations / Interactions ---
-
-    def apply_trade(self, trade: OrderBookMessage):
-        """Applies a trade message to the base OrderBook state."""
-        super().apply_trade(trade)
-
-    def apply_snapshot(self, bids: List[List[str]], asks: List[List[str]], update_id: int):
-        """
-        Applies a snapshot represented by bids and asks lists to the base OrderBook state.
-        CALLED INTERNALLY - Direct external calls are DISCOURAGED.
-        """
-        # Assumes lock is held
-        super().apply_snapshot(bids, asks, update_id)
-        # Ensure the base class snapshot_uid is also updated
-        # self._snapshot_uid is the attribute name in the C implementation
-        try:
-            self._snapshot_uid = update_id
-        except AttributeError:
-            # Fallback if the attribute name differs or isn't directly settable
-            self.logger().warning("Could not directly set _snapshot_uid on base OrderBook class.")
-
-    def apply_diffs(self, bids: List[List[str]], asks: List[List[str]], update_id: int):
-        """
-        Applies differential updates to the base OrderBook state.
-
-        NOTE: This LunoOrderBook implementation uses snapshots for base class updates.
-        Calling this method directly will lead to inconsistencies.
-        """
-        self.logger().warning(
-            f"[{self._trading_pair}] apply_diffs called on LunoOrderBook. "
-            f"This implementation uses snapshot updates for the base class state. "
-            f"Direct diff application is not supported and may cause inconsistencies."
-        )
-        # Do not call super().apply_diffs()
-
-    # --- Methods Operating on Base Class State (Inherited) ---
-    # (No changes needed here, methods are inherited)
-
-    # --- Custom Methods for Luno Detailed State ---
-
-    def get_internal_detailed_book(self) -> Optional[Tuple[SortedDict, SortedDict, int]]:
-        """
-        Returns thread-safe copies of the INTERNAL DETAILED order book state.
-        Useful for logic needing order-level detail (e.g., advanced execution).
-
-        :return: (bids_copy, asks_copy, sequence) where bids/asks are
-                 SortedDict[Decimal, Dict[str, Decimal]], or None if not initialized.
-        """
-        with self._lock:
-            if self._sequence == -1:
-                return None
-            bids_copy = self._bids_internal.copy()
-            asks_copy = self._asks_internal.copy()
-            return bids_copy, asks_copy, self._sequence
-
-    def get_aggregated_snapshot(self) -> Tuple[SortedDict, SortedDict, int]:
-        """
-        Returns a thread-safe, AGGREGATED copy of the current order book state
-        in a format convenient for calculations (SortedDict[Decimal, Decimal]).
-        Derived from the internal detailed state.
-
-        :return: (aggregated_bids, aggregated_asks, sequence) - empty SortedDicts if not initialized.
-        """
-        with self._lock:
-            if self._sequence == -1:
-                return SortedDict(), SortedDict(), self._sequence
-
-            # Aggregate Bids
-            aggregated_bids = SortedDict()
-            for price, orders_at_price in self._bids_internal.items():
-                total_volume = sum(orders_at_price.values())
-                if total_volume > self._DUST_THRESHOLD_HUMMINGBOT:
-                    aggregated_bids[price] = total_volume
-
-            # Aggregate Asks
-            aggregated_asks = SortedDict()
-            for price, orders_at_price in self._asks_internal.items():
-                total_volume = sum(orders_at_price.values())
-                if total_volume > self._DUST_THRESHOLD_HUMMINGBOT:
-                    aggregated_asks[price] = total_volume
-
-            return aggregated_bids, aggregated_asks, self._sequence
-
-    # --- Internal Helper Methods ---
-
-    def _reset_state_internal(self):
-        """Clears internal detailed book data and resets sequence/flags."""
-        # Assumes lock is held
-        self.logger().debug(f"Resetting internal detailed state for {self._trading_pair}.")
-        self._bids_internal.clear()
-        self._asks_internal.clear()
-        self._order_id_map.clear()
+    # --- Public State Management ---
+    def reset_state(self) -> None:
+        """Clears internal detailed state and resets sequence."""
+        self._bids.clear()
+        self._asks.clear()
+        self._order_map.clear()
         self._sequence = -1
-        self._last_update_timestamp = -1.0
         # Reset base class snapshot UID tracking as well
         self._snapshot_uid = -1
-        self._last_diff_uid = -1
+        self.logger().info(f"[{self._trading_pair}] Internal state reset.")
 
-    @staticmethod
-    def _parse_luno_timestamp(timestamp_ms: Any) -> float:
-        """Safely parse Luno timestamp (ms) to float seconds."""
-        try:
-            ts = float(timestamp_ms)
-            # Luno uses ms since epoch
-            return ts / 1000.0
-        except (ValueError, TypeError):
-            # Fallback to current time if parsing fails
-            return time.time()
+    # --- Internal State Modification Helpers (Assume Lock Held) ---
 
-    def _populate_side_from_luno(self,
-                                 internal_book_side: SortedDict[Decimal, Dict[str, Decimal]],
-                                 luno_orders: List[Dict[str, str]],
-                                 side: TradeType):
+    def _load_side(
+            self,
+            internal_book_side: SortedDict[Decimal, Dict[str, Decimal]],
+            orders: List[Dict[str, str]],
+            side: TradeType
+    ) -> None:
         """Helper to populate internal bids or asks from Luno snapshot data."""
-        # Assumes lock is held
-        for order in luno_orders:
+        orders_loaded = 0
+        for order_data in orders:
             try:
-                order_id = order['id']
-                price = Decimal(order['price'])
-                volume = Decimal(order['volume'])
+                order_id = order_data["id"]
+                price = Decimal(order_data["price"])
+                amount = Decimal(order_data["volume"])
 
-                if volume > self._DUST_THRESHOLD_INTERNAL:
-                    if price not in internal_book_side:
-                        internal_book_side[price] = {}
-
-                    if order_id in self._order_id_map:
-                        self.logger().warning(f"[{self._trading_pair}] Duplicate order ID '{order_id}' in snapshot. Overwriting: {order}")
-                        # Clean up old entry if necessary (should ideally not happen in clean snapshot)
-                        old_price, old_side = self._order_id_map[order_id]
+                if amount > self._DUST_THRESHOLD:
+                    # Handle potential duplicate order IDs gracefully (overwrite)
+                    if order_id in self._order_map:
+                        self.logger().warning(f"[{self._trading_pair}] Duplicate order ID '{order_id}' found during snapshot load. Overwriting.")
+                        old_price, old_side = self._order_map[order_id]
+                        # Clean up old entry if it was in a different place (shouldn't happen in clean snapshot)
                         if old_price != price or old_side != side:
-                            old_book = self._bids_internal if old_side == TradeType.BUY else self._asks_internal
+                            old_book = self._bids if old_side == TradeType.BUY else self._asks
                             if old_price in old_book and order_id in old_book[old_price]:
                                 del old_book[old_price][order_id]
                                 if not old_book[old_price]:
                                     del old_book[old_price]
 
-                    internal_book_side[price][order_id] = volume
-                    self._order_id_map[order_id] = (price, side)
+                    # Ensure price level exists and add/update order
+                    internal_book_side.setdefault(price, {})[order_id] = amount
+                    # Update map
+                    self._order_map[order_id] = (price, side)
+                    orders_loaded += 1
             except (KeyError, ValueError, TypeError, InvalidOperation) as e:
-                # Log error for the specific order but continue processing others
-                self.logger().warning(f"[{self._trading_pair}] Error processing single snapshot order: {e}. Order: {order}", exc_info=False)
+                self.logger().warning(
+                    f"[{self._trading_pair}] Skipping invalid order during snapshot load: {order_data}. Error: {e}",
+                    exc_info=False
+                )
+        # self.logger().debug(f"[{self._trading_pair}] Loaded {orders_loaded} orders for {side.name} side from snapshot.")
 
-    def _apply_luno_update_internal(self, update: Dict[str, Any]) -> bool:
-        """
-        Applies 'create', 'delete', or 'trade' updates from a Luno stream message
-        to the internal detailed order book state.
-        Assumes lock is held.
+    def _apply_create(self, create_data: Dict[str, str]) -> bool:
+        """Applies a create_update message."""
+        try:
+            order_id = create_data["order_id"]
+            price = Decimal(create_data["price"])
+            amount = Decimal(create_data["volume"])
+            order_type_str = create_data["type"]  # "BID" or "ASK"
 
-        :param update: The Luno update message part containing create/delete/trade info.
-        :return: True if the internal book state actually changed, False otherwise.
-        """
-        state_changed = False
+            if order_id in self._order_map:
+                self.logger().warning(f"[{self._trading_pair}] Create update for existing order_id {order_id}. Ignoring create.")
+                return False
 
-        # --- Process Create Update ---
-        create_data = update.get("create_update")
-        if create_data and isinstance(create_data, dict):
-            try:
-                order_id = create_data["order_id"]
-                price = Decimal(create_data["price"])
-                volume = Decimal(create_data["volume"])
-                order_type_str = create_data["type"]  # "BID" or "ASK"
+            if amount <= self._DUST_THRESHOLD:
+                return False  # Ignore dust orders
 
-                if order_id in self._order_id_map:
-                    self.logger().warning(f"[{self._trading_pair}] Create update for existing order_id {order_id}. Ignoring create.")
-                elif order_type_str == "BID":
-                    side = TradeType.BUY
-                    book = self._bids_internal
-                    if price not in book:
-                        book[price] = {}
-                    book[price][order_id] = volume
-                    self._order_id_map[order_id] = (price, side)
-                    state_changed = True  # State definitely changed
-                elif order_type_str == "ASK":
-                    side = TradeType.SELL
-                    book = self._asks_internal
-                    if price not in book:
-                        book[price] = {}
-                    book[price][order_id] = volume
-                    self._order_id_map[order_id] = (price, side)
-                    state_changed = True  # State definitely changed
+            if order_type_str == "BID":
+                side = TradeType.BUY
+                book = self._bids
+            elif order_type_str == "ASK":
+                side = TradeType.SELL
+                book = self._asks
+            else:
+                self.logger().warning(f"[{self._trading_pair}] Unknown order type in create_update: {order_type_str}")
+                return False
+
+            book.setdefault(price, {})[order_id] = amount
+            self._order_map[order_id] = (price, side)
+            return True
+        except (KeyError, ValueError, TypeError, InvalidOperation) as e:
+            self.logger().warning(f"[{self._trading_pair}] Failed to process create_update: {e}. Data: {create_data}", exc_info=False)
+            return False
+
+    def _apply_delete(self, delete_data: Dict[str, Any]) -> bool:
+        """Applies a delete_update message."""
+        try:
+            order_id = delete_data["order_id"]
+            order_info = self._order_map.pop(order_id, None)  # Use pop atomically
+
+            if order_info:
+                price, side = order_info
+                book = self._bids if side is TradeType.BUY else self._asks
+                level = book.get(price)
+
+                if level and order_id in level:
+                    del level[order_id]
+                    if not level:  # Is price level now empty?
+                        del book[price]
+                    return True
                 else:
-                    self.logger().warning(f"[{self._trading_pair}] Create update with unknown type: {order_type_str}. Data: {create_data}")
+                    self.logger().error(f"[{self._trading_pair}] Inconsistency: Delete order {order_id} in map but not in book.")
+                    return False
+            else:
+                return False  # Order not in map
+        except (KeyError, ValueError, TypeError) as e:
+            self.logger().warning(f"[{self._trading_pair}] Failed to process delete_update: {e}. Data: {delete_data}", exc_info=False)
+            return False
 
-            except (KeyError, ValueError, TypeError, InvalidOperation) as e:
-                self.logger().warning(f"[{self._trading_pair}] Error processing create_update {create_data}: {e}", exc_info=False)
+    def _apply_trade_update(self, trade_data: Dict[str, Any]) -> bool:
+        """Applies a trade_updates item."""
+        try:
+            maker_order_id = trade_data["maker_order_id"]
+            base_volume_traded = Decimal(trade_data["base"])
 
-        # --- Process Delete Update ---
-        delete_data = update.get("delete_update")
-        if delete_data and isinstance(delete_data, dict):
-            try:
-                order_id = delete_data["order_id"]
-                order_info = self._order_id_map.pop(order_id, None)  # Use pop to remove and get info
+            if base_volume_traded <= self._DUST_THRESHOLD:
+                return False
 
-                if order_info:
-                    price, side = order_info
-                    book = self._bids_internal if side == TradeType.BUY else self._asks_internal
-                    if price in book and order_id in book[price]:
-                        del book[price][order_id]
-                        if not book[price]:
-                            del book[price]
-                        state_changed = True  # State changed
-                    else:
-                        self.logger().error(f"[{self._trading_pair}] Inconsistency: Delete order {order_id} in map but not in book structure ({side.name} @ {price}).")
-            except (KeyError, ValueError, TypeError) as e:  # KeyError should be less likely now
-                self.logger().warning(f"[{self._trading_pair}] Error processing delete_update {delete_data}: {e}", exc_info=False)
+            order_info = self._order_map.get(maker_order_id)
+            if not order_info:
+                return False
 
-        # --- Process Trade Updates ---
-        trade_list = update.get("trade_updates")
-        if trade_list and isinstance(trade_list, list):
-            for trade in trade_list:
-                try:
-                    # Ensure necessary keys exist before processing
-                    if "maker_order_id" not in trade or "base" not in trade:
-                        self.logger().warning(f"[{self._trading_pair}] Skipping trade update missing maker_order_id or base: {trade}")
-                        continue
+            price, side = order_info
+            book = self._bids if side is TradeType.BUY else self._asks
+            level = book.get(price)
 
-                    maker_order_id = trade["maker_order_id"]
-                    base_volume_traded = Decimal(trade["base"])
+            if not level or maker_order_id not in level:
+                self.logger().error(f"[{self._trading_pair}] Inconsistency: Trade maker order {maker_order_id} in map but not in book level {price}.")
+                self._order_map.pop(maker_order_id, None)
+                return False
 
-                    if base_volume_traded <= self._DUST_THRESHOLD_INTERNAL:
-                        continue
+            # --- Apply volume reduction ---
+            current_volume = level[maker_order_id]
+            new_volume = current_volume - base_volume_traded
 
-                    order_info = self._order_id_map.get(maker_order_id)
+            if new_volume <= self._DUST_THRESHOLD:
+                # Fully filled or dust remaining - remove order
+                del level[maker_order_id]
+                self._order_map.pop(maker_order_id, None)
+                if not level:
+                    del book[price]
+            else:
+                level[maker_order_id] = new_volume
 
-                    if order_info:
-                        price, side = order_info
-                        book = self._bids_internal if side == TradeType.BUY else self._asks_internal
+            return True
+        except (KeyError, ValueError, TypeError, InvalidOperation) as e:
+            self.logger().warning(f"[{self._trading_pair}] Failed to process trade_update: {e}. Data: {trade_data}", exc_info=False)
+            return False
 
-                        if price in book and maker_order_id in book[price]:
-                            current_volume = book[price][maker_order_id]
-                            new_volume = current_volume - base_volume_traded
+    def _trim_book(self) -> None:
+        """Removes price levels beyond the _DEPTH_LIMIT from internal state and _order_map."""
+        # Assumes lock is held
+        removed_orders_count = 0
+        # Trim bids (remove lowest prices)
+        while len(self._bids) > self._DEPTH_LIMIT:
+            price_to_remove, orders_at_level = self._bids.popitem(0)
+            for order_id in list(orders_at_level.keys()):  # Iterate keys for safe deletion
+                self._order_map.pop(order_id, None)
+                removed_orders_count += 1
+        # Trim asks (remove highest prices)
+        while len(self._asks) > self._DEPTH_LIMIT:
+            price_to_remove, orders_at_level = self._asks.popitem(-1)
+            for order_id in list(orders_at_level.keys()):  # Iterate keys for safe deletion
+                self._order_map.pop(order_id, None)
+                removed_orders_count += 1
 
-                            if new_volume <= self._DUST_THRESHOLD_INTERNAL:
-                                del book[price][maker_order_id]
-                                if not book[price]:
-                                    del book[price]
-                                del self._order_id_map[maker_order_id]  # Remove from map
-                            else:
-                                book[price][maker_order_id] = new_volume
+        if removed_orders_count > 0:
+            self.logger().debug(f"[{self._trading_pair}] Trimmed {removed_orders_count} orders from internal book/map.")
 
-                            state_changed = True  # Trade always changes state if processed
-                        else:
-                            self.logger().error(
-                                f"[{self._trading_pair}] Inconsistency: Trade maker order {maker_order_id} in map but not in book structure ({side.name} @ {price}).")
-                            self._order_id_map.pop(maker_order_id, None)  # Clean up map
+    # --- Base Class Update ---
 
-                except (KeyError, ValueError, TypeError, InvalidOperation) as e:
-                    self.logger().warning(f"[{self._trading_pair}] Error processing trade_update {trade}: {e}", exc_info=False)
-
-        return state_changed
-
-    def _process_luno_status_update(self, update: Dict[str, Any]):
-        """Processes status updates from Luno. Assumes lock is held."""
-        status_data = update.get("status_update")
-        if status_data and isinstance(status_data, dict):
-            status = status_data.get("status")
-            self.logger().info(f"[{self._trading_pair}] Received status update: {status}")
-            # Add logic here if specific statuses require action (e.g., market suspension)
-
-    def _aggregate_internal_book(self) -> Tuple[List[OrderBookRow], List[OrderBookRow]]:
+    def _apply_snapshot_to_base_book(self, update_id: int) -> None:
         """
-        Aggregates the internal detailed order book into the list format
-        required by Hummingbot's apply_snapshot. Assumes lock is held.
-
-        :return: Tuple containing (formatted_bids, formatted_asks)
-                 Each list contains OrderBookRow objects.
+        Aggregates the (trimmed) internal detailed state and applies it as a snapshot
+        to the base Hummingbot OrderBook using the standard List[OrderBookRow] format.
+        Assumes lock is held.
         """
-        hb_bids = []
-        # Iterate bids (descending price) - base class apply_snapshot handles sorting
-        for price, orders in self._bids_internal.items():
-            total_volume = sum(orders.values())
-            if total_volume > self._DUST_THRESHOLD_HUMMINGBOT:
-                hb_bids.append(OrderBookRow(Decimal(price), Decimal(total_volume), self._sequence))
+        bids_list, asks_list = self.get_aggregated_snapshot(update_id) or ([], [])
 
-        hb_asks = []
-        # Iterate asks (ascending price)
-        for price, orders in self._asks_internal.items():
-            total_volume = sum(orders.values())
-            if total_volume > self._DUST_THRESHOLD_HUMMINGBOT:
-                hb_asks.append(OrderBookRow(Decimal(price), Decimal(total_volume), self._sequence))
+        # Call the base class snapshot method
+        try:
+            # Use apply_snapshot to ensure snapshot_uid is updated
+            super().apply_snapshot(bids_list, asks_list, update_id)
+        except Exception as e:
+            # Catch potential errors during base class update
+            self.logger().exception(f"[{self._trading_pair}] Error applying snapshot to base OrderBook class: {e}")
 
-        return hb_bids, hb_asks
+    # --- Public Accessor ---
 
-    def _apply_snapshot_to_base_book(self):
+    def get_aggregated_snapshot(self, update_id: int) -> Optional[Tuple[List[OrderBookRow], List[OrderBookRow]]]:
         """
-        Aggregates the internal detailed state and applies it as a snapshot
-        to the base Hummingbot OrderBook. Assumes lock is held.
+        Returns an aggregated snapshot of the current internal order book state.
+
+        :return: A tuple of two lists: (bids, asks), where each list contains tuples of (price_str, volume_str).
         """
         if self._sequence == -1:
-            self.logger().warning(f"[{self._trading_pair}] Attempted to apply snapshot to base book before initialization.")
-            return
+            return None
 
-        hb_bids, hb_asks = self._aggregate_internal_book()
-        # Call the base class method using super()
-        super().apply_snapshot(
-            bids=hb_bids,
-            asks=hb_asks,
-            update_id=self._sequence  # Use Luno sequence as update_id
-        )
-        # Ensure the snapshot_uid property is updated
-        try:
-            # Try setting the protected attribute directly if necessary
-            self._snapshot_uid = self._sequence
-            if (self._sequence % 10) == 0:
-                self.logger().info(f"[{self._trading_pair}] Applied snapshot to base OrderBook. Seq/UpdateID: {self._sequence}")
-        except AttributeError:
-            self.logger().debug(f"[{self._trading_pair}] Applied snapshot to base OrderBook. Seq/UpdateID: {self._sequence}. (_snapshot_uid not directly settable)")
+        # Aggregate bids (price_str, volume_str) - sorted high to low for base class
+        bids_list: List[OrderBookRow] = []
+        for price, level_orders in reversed(self._bids.items()):  # Iterate high to low
+            total_volume = sum(level_orders.values())
+            if total_volume > self._HB_DUST_THRESHOLD:  # Use HB threshold for snapshot
+                bids_list.append(OrderBookRow(float(price), float(total_volume), update_id))
+
+        # Aggregate asks (price_str, volume_str) - sorted low to high for base class
+        asks_list: List[OrderBookRow] = []
+        for price, level_orders in self._asks.items():  # Iterate low to high
+            total_volume = sum(level_orders.values())
+            if total_volume > self._HB_DUST_THRESHOLD:
+                asks_list.append(OrderBookRow(float(price), float(total_volume), update_id))
+
+        return bids_list, asks_list

@@ -1,6 +1,6 @@
 import asyncio
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, cast
 
 from bidict import bidict
 
@@ -167,7 +167,7 @@ class LunoExchange(ExchangePyBase):
 
     def _create_user_stream_data_source(self) -> UserStreamTrackerDataSource:
         return LunoAPIUserStreamDataSource(
-            auth=self._auth,
+            auth=cast(LunoAuth, self._auth),
             trading_pairs=self._trading_pairs,
             connector=self,
             api_factory=self._web_assistants_factory,
@@ -969,26 +969,44 @@ class LunoExchange(ExchangePyBase):
             # Clear the trading pair symbol map when the API call fails
             self._set_trading_pair_symbol_map(bidict())
 
+    async def get_last_traded_prices(self, trading_pairs: List[str]) -> Dict[str, float]:
+        """
+        Return a dictionary the trading_pair as key and the current price as value for each trading pair passed as
+        parameter
+        :param trading_pairs: list of trading pairs to get the prices for
+        :return: Dictionary of associations between token pair and its latest price
+        """
+        tasks = [self._get_last_traded_price(trading_pair=trading_pair) for trading_pair in trading_pairs]
+        results = await safe_gather(*tasks)
+        return {t_pair: result for t_pair, result in zip(trading_pairs, results)}
+
     async def _get_last_traded_price(self, trading_pair: str) -> Decimal:
         """
-        Retrieves the last traded price for a trading pair
+        Retrieves the last traded price for a trading pair using the trades endpoint
         :param trading_pair: the trading pair
         :return: the last traded price
         """
         exchange_symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
 
-        # Request ticker information for the pair
+        # Request recent trades for the pair
         params = {
             "pair": exchange_symbol
         }
 
-        ticker_response = await self._api_get(
-            path_url=CONSTANTS.TICKER_URL,
+        trades_response = await self._api_get(
+            path_url=CONSTANTS.TRADES_URL,
             params=params
         )
 
-        # Extract the last trade price
-        last_price = Decimal(str(ticker_response.get("last_trade", "0")))
+        # Extract the most recent trade price (trades are sorted from newest to oldest)
+        trades = trades_response.get("trades", [])
+        if not trades:
+            self.logger().warning(f"No trades found for {trading_pair}. Returning 0.")
+            return Decimal("0")
+
+        # Get the most recent trade (first in the list)
+        most_recent_trade = trades[0]
+        last_price = Decimal(str(most_recent_trade.get("price", "0")))
         return last_price
 
     def get_price_for_volume(self, trading_pair: str, is_buy: bool, volume: Decimal):
@@ -1115,4 +1133,5 @@ class LunoExchange(ExchangePyBase):
         """
         Returns the BudgetChecker associated with this exchange.
         """
+        # noinspection PyUnresolvedReferences
         return self._budget_checker
