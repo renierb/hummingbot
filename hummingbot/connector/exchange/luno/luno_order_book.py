@@ -112,7 +112,7 @@ class LunoOrderBook(OrderBook):
                     return False
 
                 if seq <= self._sequence:
-                    # self.logger().debug(f"[{self._trading_pair}] Ignoring old sequence {seq} (current {self._sequence}).")
+                    self.logger().warning(f"[{self._trading_pair}] Ignoring old sequence {seq} (current {self._sequence}).")
                     return False
 
                 if seq > self._sequence + 1:

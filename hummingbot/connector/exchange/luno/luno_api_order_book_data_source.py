@@ -2,7 +2,7 @@ import asyncio
 import json
 import time
 from decimal import Decimal, InvalidOperation
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, cast
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from hummingbot.connector.exchange.luno import (  # Added web_utils
     luno_constants as CONSTANTS,
@@ -68,29 +68,49 @@ class LunoAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
     async def listen_for_subscriptions(self):
         """
-        Main entry point to start and manage WebSocket listeners for all trading pairs.
+        Main entry point to establish and maintain WebSocket connections for all trading pairs.
+
+        Creates separate WebSocket connections for each trading pair, tracks them,
+        and handles proper cancellation upon shutdown.
         """
-        self.logger().info("Starting WebSocket listeners for all trading pairs...")
+        self.logger().info(f"Starting WebSocket listeners for {len(self._trading_pairs)} trading pairs...")
+
         tasks = []
         try:
-            # Create and manage a listening task for each trading pair
+            # Create a separate task for each trading pair
             for trading_pair in self._trading_pairs:
-                task = asyncio.create_task(self._listen_to_pair_stream(trading_pair))
-                tasks.append(task)
+                listener_task = asyncio.create_task(
+                    self._listen_to_pair_stream(trading_pair)
+                )
+                listener_task.set_name(f"ws_listener_{trading_pair}")
+                tasks.append(listener_task)
 
             if not tasks:
-                self.logger().warning("No listeners started. Ensure trading pairs are configured correctly.")
-                return None  # Exit if no tasks were created
+                self.logger().warning("No WebSocket listener tasks created. Check trading pairs configuration.")
+                return
 
-            # Wait for all tasks to complete (they run indefinitely until cancelled/error)
-            return asyncio.gather(*tasks)
+            # Keep the listener running until canceled
+            await asyncio.gather(*tasks, return_exceptions=True)
 
         except asyncio.CancelledError:
-            self.logger().info("WebSocket listeners task cancelled.")
-            return None  # Propagate cancellation
-        except Exception:
-            self.logger().error("Unexpected error in listen_for_subscriptions.", exc_info=True)
-            return None
+            self.logger().info("WebSocket listener tasks are being cancelled...")
+            # Cancel all tasks explicitly to ensure clean shutdown
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            # Wait for all tasks to complete their cancellation (with timeout)
+            if tasks:
+                await asyncio.wait(tasks, timeout=5.0)
+            raise  # Re-raise CancelledError
+        except Exception as e:
+            self.logger().error(f"Unexpected error in WebSocket listeners: {e}", exc_info=True)
+            # Cancel all tasks on unexpected error
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            # Wait for all tasks to complete their cancellation (with timeout)
+            if tasks:
+                await asyncio.wait(tasks, timeout=5.0)
 
     async def _listen_to_pair_stream(self, trading_pair: str):
         """
@@ -105,7 +125,7 @@ class LunoAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
         # Ensure the order book instance is available
         try:
-            order_book: LunoOrderBook = cast(LunoOrderBook, self._connector.order_book_tracker.order_books[trading_pair])
+            order_book = self._connector.get_order_book(trading_pair)
         except KeyError:
             self.logger().error(f"[{trading_pair}] Order book not found in tracker. Stopping listener task.")
             return
@@ -137,12 +157,14 @@ class LunoAPIOrderBookDataSource(OrderBookTrackerDataSource):
                         # Check if it's the initial snapshot (based on keys and book state)
                         is_initial_book = (
                             "asks" in parsed_msg and "bids" in parsed_msg and "sequence" in parsed_msg
-                            and order_book._sequence == -1  # Book expects snapshot
+                            and order_book.snapshot_uid == -1  # Book expects snapshot
                         )
+
+                        order_book = self._connector.get_order_book(trading_pair)
 
                         if is_initial_book:
                             order_book.process_snapshot(parsed_msg)
-                            # We don't need to put snapshot on a queue for tracker consumption
+                            # We don't need to put a snapshot on a queue for tracker consumption
                             # because LunoOrderBook updates the base class internally.
                             # We *could* put a minimal signal on diff queue if tracker needs it.
                             await self._signal_tracker_update(trading_pair, parsed_msg, timestamp)
@@ -328,8 +350,6 @@ class LunoAPIOrderBookDataSource(OrderBookTrackerDataSource):
             content={
                 "trading_pair": trading_pair,
                 "update_id": int(raw_msg["sequence"]),
-                "bids": [],  # No data needed here
-                "asks": []  # No data needed here
             },
             timestamp=timestamp
         )
@@ -356,27 +376,6 @@ class LunoAPIOrderBookDataSource(OrderBookTrackerDataSource):
         while True:
             trade_msg = await queue.get()  # Already an OrderBookMessage
             await output.put(trade_msg)
-
-    async def listen_for_order_book_snapshots(
-            self, ev_loop: asyncio.BaseEventLoop, output: asyncio.Queue
-    ):
-        """
-        Listens for order book snapshots.
-        NOTE: In this implementation, the initial snapshot is processed directly
-        via WebSocket in `_listen_to_pair_stream`. This method remains for
-        compatibility but won't receive snapshots unless explicitly put on a
-        snapshot queue (which is currently removed). The REST fallback logic
-        is removed to rely solely on the WebSocket flow.
-        """
-        self.logger().info("listen_for_order_book_snapshots started, but relies on WebSocket initial snapshot.")
-        # Keep the loop structure for compatibility, but it won't do anything
-        # unless snapshots are manually put onto a queue this method listens to.
-        while True:
-            # If a snapshot queue were used:
-            # snapshot_msg = await self._message_queue[self._snapshot_queue_key].get()
-            # await output.put(snapshot_msg)
-            # For now, just sleep to prevent busy-looping if called unexpectedly
-            await asyncio.sleep(3600)  # Sleep for a long time
 
     # --- Fallback/Test Snapshot Method ---
     async def _request_order_book_snapshot(self, trading_pair: str) -> Dict[str, Any]:

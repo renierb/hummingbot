@@ -1,5 +1,5 @@
 import asyncio
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, cast
 
 from bidict import bidict
@@ -10,12 +10,12 @@ from hummingbot.connector.exchange.luno import luno_constants as CONSTANTS, luno
 from hummingbot.connector.exchange.luno.luno_api_order_book_data_source import LunoAPIOrderBookDataSource
 from hummingbot.connector.exchange.luno.luno_api_user_stream_data_source import LunoAPIUserStreamDataSource
 from hummingbot.connector.exchange.luno.luno_auth import LunoAuth
+from hummingbot.connector.exchange.luno.luno_order_book import LunoOrderBook
 from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.utils import TradeFillOrderDetails, combine_to_hb_trading_pair
 from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate, TradeUpdate
-from hummingbot.core.data_type.order_book import OrderBook
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 from hummingbot.core.data_type.trade_fee import (
     AddedToCostTradeFee,
@@ -338,22 +338,22 @@ class LunoExchange(ExchangePyBase):
         return exchange_order_id, timestamp
 
     async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder):
-        """
-        Cancels an order using the Luno API.
-        """
-        # Luno requires the exchange_order_id to cancel an order
+        """Cancels an order using the Luno API."""
+        path_url = CONSTANTS.STOP_ORDER_URL
         params = {
             "order_id": tracked_order.exchange_order_id
         }
-
-        cancel_result = await self._api_post(
-            path_url=CONSTANTS.LIMIT_ORDER_URL,
-            params=params,
-            is_auth_required=True
-        )
-
-        # Luno returns {"success": true} on successful cancellation
-        return cancel_result.get("success", False)
+        try:
+            cancel_result = await self._api_post(
+                path_url=path_url,
+                params=params,
+                is_auth_required=True
+            )
+            # Check success field
+            return cancel_result.get("success", False)
+        except Exception as e:
+            self.logger().error(f"Failed to cancel order {tracked_order.client_order_id} (Exch ID: {tracked_order.exchange_order_id}): {e}", exc_info=True)
+            return False
 
     async def _format_trading_rules(self, exchange_info_dict: Dict[str, Any]) -> List[TradingRule]:
         """
@@ -564,253 +564,310 @@ class LunoExchange(ExchangePyBase):
             self._account_available_balances[currency] = available
             self._account_balances[currency] = balance
 
-    async def _update_order_fills_from_trades(self):
+    def _parse_luno_trade_fill(self, trade_data: Dict[str, Any], tracked_order: Optional[InFlightOrder] = None) -> Optional[Tuple[str, TradeUpdate, Optional[OrderFilledEvent]]]:
         """
-        This is intended to be a backup method to get filled events with trade ID for orders,
-        in case Luno's user stream events are not working.
+        Parses a Luno trade dict into standard Hummingbot objects.
+        Returns (exchange_trade_id, TradeUpdate, Optional[OrderFilledEvent for untracked])
         """
-        small_interval_last_tick = self._last_poll_timestamp / self.UPDATE_ORDER_STATUS_MIN_INTERVAL
-        small_interval_current_tick = self.current_timestamp / self.UPDATE_ORDER_STATUS_MIN_INTERVAL
-        long_interval_last_tick = self._last_poll_timestamp / self.LONG_POLL_INTERVAL
-        long_interval_current_tick = self.current_timestamp / self.LONG_POLL_INTERVAL
+        if not trade_data or not isinstance(trade_data, dict):
+            return None
+        try:
+            exchange_trade_id = str(trade_data.get("trade_id", ""))  # Luno REST trades have trade_id
+            exchange_order_id = str(trade_data.get("order_id", ""))
+            price = self._safe_decimal_convert(trade_data.get("price"))
+            amount = self._safe_decimal_convert(trade_data.get("volume"))
+            fee_amount = self._safe_decimal_convert(trade_data.get("fee"))
+            fee_currency = trade_data.get("fee_currency")
+            timestamp_ms = trade_data.get("timestamp")
+            is_buy = trade_data.get("is_buy", False)  # REST API provides is_buy
+            timestamp = self._time_synchronizer.time() if timestamp_ms is None else float(timestamp_ms) / 1000.0
 
-        if (long_interval_current_tick > long_interval_last_tick
-                or (self.in_flight_orders and small_interval_current_tick > small_interval_last_tick)):
-            query_time = int(self._last_trades_poll_luno_timestamp * 1e3)
-            self._last_trades_poll_luno_timestamp = self._time_synchronizer.time()
-            order_by_exchange_id_map = {}
-            for order in self._order_tracker.all_fillable_orders.values():
-                order_by_exchange_id_map[order.exchange_order_id] = order
+            if not exchange_trade_id or not exchange_order_id or amount <= 0:
+                # Essential info missing
+                return None
 
-            tasks = []
-            trading_pairs = self.trading_pairs
-            for trading_pair in trading_pairs:
-                pair_symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
-                if pair_symbol is None:
-                    self.logger().warning(f"Trading pair {trading_pair} not found in exchange.")
-                    continue
-                params = {
-                    "pair": pair_symbol,
-                    "since": query_time if self._last_poll_timestamp > 0 else None,
-                    "limit": 100  # Fetch up to 100 recent trades
-                }
-                tasks.append(self._api_get(
-                    path_url=CONSTANTS.TRADES_URL,
-                    params=params,
-                    is_auth_required=True))
+            # Determine Trading Pair if possible (might need it passed in)
+            # This example assumes we know the pair contextually
+            trading_pair = tracked_order.trading_pair if tracked_order else None
+            if not trading_pair and "pair" in trade_data:  # Fallback if pair is in trade data
+                try:
+                    trading_pair = self.trading_pair_associated_to_exchange_symbol(trade_data["pair"])
+                except KeyError:
+                    pass  # Symbol not found
+            if not trading_pair:
+                return None  # Cannot process without pair
 
-            self.logger().debug(f"Polling for order fills of {len(tasks)} trading pairs.")
-            results = await safe_gather(*tasks, return_exceptions=True)
+            # Determine Trade Type
+            trade_type = TradeType.BUY if is_buy else TradeType.SELL
 
-            for trades, trading_pair in zip(results, trading_pairs):
-                if isinstance(trades, Exception):
-                    self.logger().network(
-                        f"Error fetching trades update for {trading_pair}: {trades}.",
-                        app_warning_msg=f"Failed to fetch trade update for {trading_pair}."
-                    )
-                    # Log more details about the error for debugging
-                    self.logger().debug(f"Error details for {trading_pair}: {type(trades).__name__}, {str(trades)}")
-                    continue
+            # Build Fee
+            flat_fees = []
+            if fee_amount > 0 and fee_currency:
+                flat_fees.append(TokenAmount(amount=fee_amount, token=fee_currency))
+            # Note: Luno fee might be deducted from quote (buy) or base (sell)
+            # AddedToCostTradeFee might be more appropriate if fee asset matches quote/base respectively
+            # Using DeductedFromReturnsTradeFee as a general placeholder if logic isn't more specific
+            fee = DeductedFromReturnsTradeFee(flat_fees=flat_fees)
+            # fee = TradeFeeBase.new_spot_fee(...) # Can also use this
 
-                # Check if trades is a list (expected format)
-                if not isinstance(trades, list) and isinstance(trades, dict) and "trades" in trades:
-                    trades = trades.get("trades", [])
+            trade_update = None
+            order_filled_event = None
 
-                # Handle None trades to prevent TypeError
-                if trades is None:
-                    self.logger().warning(f"Received None instead of trades list for {trading_pair}. Skipping trade updates.")
-                    continue
-
-                for trade in trades:
-                    # Skip invalid trades
-                    if not trade or not isinstance(trade, dict):
-                        continue
-
-                    # Safely get order_id, handling None values
-                    order_id = trade.get("order_id")
-                    if order_id is None:
-                        continue
-
-                    exchange_order_id = str(order_id)
-                    if exchange_order_id in order_by_exchange_id_map:
-                        # This is a fill for a tracked order
-                        tracked_order = order_by_exchange_id_map[exchange_order_id]
-
-                        # Extract trade details with safe handling of None values
-                        trade_id = str(trade.get("trade_id", ""))
-
-                        # Safely convert price to Decimal, handling None values
-                        price_str = trade.get("price")
-                        price = Decimal(str(price_str if price_str is not None else "0"))
-
-                        # Safely convert volume to Decimal, handling None values
-                        volume_str = trade.get("volume")
-                        amount = Decimal(str(volume_str if volume_str is not None else "0"))
-
-                        # Safely convert fee to Decimal, handling None values
-                        fee_str = trade.get("fee")
-                        fee_amount = Decimal(str(fee_str if fee_str is not None else "0"))
-
-                        fee_currency = trade.get("fee_currency", "")
-
-                        # Safely handle timestamp, ensuring it's not None
-                        timestamp_val = trade.get("timestamp", 0)
-                        fill_timestamp = float(timestamp_val) * 1e-3 if timestamp_val is not None else 0.0
-
-                        # Build trade update
-                        fee = TradeFeeBase.new_spot_fee(
-                            fee_schema=self.trade_fee_schema(),
-                            trade_type=tracked_order.trade_type,
-                            percent_token=fee_currency,
-                            flat_fees=[TokenAmount(amount=fee_amount, token=fee_currency)]
-                        )
-
-                        trade_update = TradeUpdate(
-                            trade_id=trade_id,
-                            client_order_id=tracked_order.client_order_id,
-                            exchange_order_id=exchange_order_id,
-                            trading_pair=trading_pair,
-                            fee=fee,
-                            fill_base_amount=amount,
-                            fill_quote_amount=amount * price,
-                            fill_price=price,
-                            fill_timestamp=fill_timestamp,
-                        )
-
-                        self._order_tracker.process_trade_update(trade_update)
-
-                    elif self.is_confirmed_new_order_filled_event(
-                            str(trade.get("trade_id", "")), exchange_order_id, trading_pair):
-                        # This is a fill of an order registered in the DB but not tracked anymore
-                        self._current_trade_fills.add(TradeFillOrderDetails(
-                            market=self.display_name,
-                            exchange_trade_id=str(trade.get("trade_id", "")),
-                            symbol=trading_pair))
-
-                        # Get timestamp with safe handling of None values
-                        timestamp_val = trade.get("timestamp", 0)
-                        timestamp = float(timestamp_val) * 1e-3 if timestamp_val is not None else 0.0  # Convert to seconds if in milliseconds
-
-                        # Get order_id with safe handling
-                        order_id_val = trade.get("order_id")
-                        order_id = self._exchange_order_ids.get(str(order_id_val) if order_id_val is not None else "", None)
-
-                        # Safely convert price to Decimal, handling None values
-                        price_str = trade.get("price")
-                        price = Decimal(str(price_str if price_str is not None else "0"))
-
-                        # Safely convert volume to Decimal, handling None values
-                        volume_str = trade.get("volume")
-                        amount = Decimal(str(volume_str if volume_str is not None else "0"))
-
-                        # Safely convert fee to Decimal, handling None values
-                        fee_str = trade.get("fee")
-                        fee_amount = Decimal(str(fee_str if fee_str is not None else "0"))
-
-                        fee_currency = trade.get("fee_currency", "")
-
-                        # Create a filled event
-                        self.trigger_event(
-                            MarketEvent.OrderFilled,
-                            OrderFilledEvent(
-                                timestamp=timestamp,
-                                order_id=order_id,
-                                trading_pair=trading_pair,
-                                trade_type=TradeType.BUY if trade.get("is_buy", False) else TradeType.SELL,
-                                order_type=OrderType.LIMIT,  # Assuming limit orders by default
-                                price=price,
-                                amount=amount,
-                                trade_fee=DeductedFromReturnsTradeFee(
-                                    flat_fees=[
-                                        TokenAmount(
-                                            fee_currency,
-                                            fee_amount
-                                        )
-                                    ]
-                                ),
-                                exchange_trade_id=str(trade.get("trade_id", ""))
-                            ))
-                        self.logger().info(f"Recreating missing trade in TradeFill: {trade}")
-
-    async def _all_trade_updates_for_order(self, order: InFlightOrder) -> List[TradeUpdate]:
-        """
-        Retrieves all trades for a specific order
-        :param order: the order for which to retrieve the trades
-        :return: a list of TradeUpdate objects
-        """
-        trade_updates = []
-
-        if order.exchange_order_id is not None:
-            exchange_order_id = order.exchange_order_id
-            trading_pair = await self.exchange_symbol_associated_to_pair(trading_pair=order.trading_pair)
-
-            # Fetch trades for the order using Luno's API
-            all_fills_response = await self._api_get(
-                path_url=CONSTANTS.TRADES_URL,
-                params={
-                    "pair": trading_pair,
-                    "order_id": exchange_order_id
-                },
-                is_auth_required=True,
-                limit_id=CONSTANTS.TRADES_URL)
-
-            # Check if response is a dictionary containing trades list
-            trades = []
-            if all_fills_response is None:
-                self.logger().warning(f"Received None response when fetching trades for order {exchange_order_id}")
-            elif isinstance(all_fills_response, dict) and "trades" in all_fills_response:
-                trades = all_fills_response["trades"]
-            elif isinstance(all_fills_response, list):
-                trades = all_fills_response
-
-            for trade in trades:
-                # Skip invalid trades
-                if not trade or not isinstance(trade, dict):
-                    continue
-
-                # Extract trade information with safe handling of None values
-                trade_id = str(trade.get("trade_id", ""))
-
-                # Safely convert price to Decimal, handling None values
-                price_str = trade.get("price")
-                price = Decimal(str(price_str if price_str is not None else "0"))
-
-                # Safely convert volume to Decimal, handling None values
-                volume_str = trade.get("volume")
-                amount = Decimal(str(volume_str if volume_str is not None else "0"))
-
-                # Safely convert fee to Decimal, handling None values
-                fee_str = trade.get("fee")
-                fee = Decimal(str(fee_str if fee_str is not None else "0"))
-
-                fee_currency = trade.get("fee_currency", "")
-
-                # Safely handle timestamp, ensuring it's not None
-                timestamp_val = trade.get("timestamp", 0)
-                timestamp = float(timestamp_val) * 1e-3 if timestamp_val is not None else 0.0  # Convert to seconds if in milliseconds
-
-                # Create fee object
-                trade_fee = TradeFeeBase.new_spot_fee(
-                    fee_schema=self.trade_fee_schema(),
-                    trade_type=order.trade_type,
-                    percent_token=fee_currency,
-                    flat_fees=[TokenAmount(amount=fee, token=fee_currency)]
-                )
-
-                # Create TradeUpdate
+            if tracked_order and tracked_order.exchange_order_id == exchange_order_id:
+                # Fill for a tracked order
                 trade_update = TradeUpdate(
-                    trade_id=trade_id,
-                    client_order_id=order.client_order_id,
+                    trade_id=exchange_trade_id,
+                    client_order_id=tracked_order.client_order_id,
                     exchange_order_id=exchange_order_id,
-                    trading_pair=order.trading_pair,
-                    fee=trade_fee,
+                    trading_pair=trading_pair,
+                    fee=fee,
                     fill_base_amount=amount,
                     fill_quote_amount=amount * price,
                     fill_price=price,
                     fill_timestamp=timestamp,
                 )
+            elif self.is_confirmed_new_order_filled_event(exchange_trade_id, exchange_order_id, trading_pair):
+                # Fill for an order registered in DB but not actively tracked
+                order_id = self._exchange_order_ids.get(exchange_order_id, None)  # Get client_id if available
+                order_filled_event = OrderFilledEvent(
+                    timestamp=timestamp,
+                    order_id=order_id or f"UNKNOWN_{exchange_order_id}",  # Use placeholder if no client_id found
+                    trading_pair=trading_pair,
+                    trade_type=trade_type,
+                    order_type=OrderType.LIMIT,  # Assume LIMIT for REST trades? Might need adjustment
+                    price=price,
+                    amount=amount,
+                    trade_fee=fee,  # Use constructed fee object
+                    exchange_trade_id=exchange_trade_id
+                )
+                self._current_trade_fills.add(TradeFillOrderDetails(
+                    market=self.display_name,
+                    exchange_trade_id=exchange_trade_id,
+                    symbol=trading_pair))
 
-                trade_updates.append(trade_update)
+            return exchange_trade_id, trade_update, order_filled_event
+
+        except Exception as e:
+            self.logger().error(f"Error parsing Luno trade data: {e}. Data: {trade_data}", exc_info=True)
+            return None
+
+    async def _update_order_fills_from_trades(self):
+        """
+        Polls the exchange's /trades endpoint as a fallback mechanism to find order fills
+        that might have been missed by the WebSocket user stream.
+
+        Fetches recent trades for tracked pairs since the last poll and processes fills
+        for orders currently being tracked or historically recorded.
+        """
+        # Calculate ticks for polling intervals
+        small_interval_last_tick = self._last_poll_timestamp // self.UPDATE_ORDER_STATUS_MIN_INTERVAL
+        small_interval_current_tick = self.current_timestamp // self.UPDATE_ORDER_STATUS_MIN_INTERVAL
+        long_interval_last_tick = self._last_poll_timestamp // self.LONG_POLL_INTERVAL
+        long_interval_current_tick = self.current_timestamp // self.LONG_POLL_INTERVAL
+
+        # Determine if a poll is necessary based on intervals and active orders
+        poll_required = (long_interval_current_tick > long_interval_last_tick or
+                         (self.in_flight_orders and small_interval_current_tick > small_interval_last_tick))
+
+        if not poll_required:
+            return  # No poll needed at this time
+
+        self.logger().debug("Polling for potential missed order fills via REST /trades endpoint...")
+
+        try:
+            # Use Luno's timestamp format (milliseconds since epoch) for the 'since' parameter
+            # Use the dedicated _last_trades_poll_luno_timestamp state variable
+            query_time_ms = int(self._last_trades_poll_luno_timestamp * 1000)
+            # Update the timestamp *before* the API calls to ensure subsequent polls don't miss trades
+            # that occur during the poll itself. Use the synchronizer for accuracy.
+            current_sync_time = self._time_synchronizer.time()
+            self._last_trades_poll_luno_timestamp = current_sync_time
+
+            # Create a map for a quick lookup of tracked orders by exchange ID
+            # Using all_orders_by_exchange_id includes potentially finished but fillable orders
+            tracked_orders_by_exchange_id = self._order_tracker.all_orders
+
+            # Prepare concurrent API calls for all relevant trading pairs
+            tasks = []
+            pairs_to_poll = list(self.trading_pairs)  # Poll all configured pairs
+
+            for trading_pair in pairs_to_poll:
+                try:
+                    exchange_symbol = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+                    params = {
+                        "pair": exchange_symbol,
+                        # Use 'since' only if we have polled before (timestamp > 1.0)
+                        "since": query_time_ms if query_time_ms > 1000 else None,
+                        "limit": 100  # Fetch recent trades, adjust limit if needed
+                    }
+                    # Remove 'since' if it's None
+                    if params["since"] is None:
+                        del params["since"]
+
+                    tasks.append(self._api_get(
+                        path_url=CONSTANTS.TRADES_URL,
+                        params=params,
+                        is_auth_required=True,  # Trades endpoint usually requires auth
+                        limit_id=CONSTANTS.TRADES_URL  # Use appropriate rate limit ID
+                    ))
+                    self.logger().debug(f"Polling /trades for {trading_pair} with params: {params}")
+
+                except Exception as e:
+                    # Log error if preparing the call fails (e.g., symbol mapping)
+                    self.logger().warning(
+                        f"Failed to prepare trade polling task for {trading_pair}: {e}", exc_info=False
+                    )
+
+            if not tasks:
+                self.logger().debug("No trade polling tasks to execute.")
+                return
+
+            # Execute API calls concurrently
+            self.logger().debug(f"Polling /trades for {len(tasks)} trading pairs.")
+            results = await safe_gather(*tasks, return_exceptions=True)
+
+            # Process results
+            for trades_response, trading_pair in zip(results, pairs_to_poll):
+                if isinstance(trades_response, Exception):
+                    self.logger().network(
+                        f"Error fetching REST trades update for {trading_pair}: {trades_response}.",
+                        app_warning_msg=f"Failed to fetch trade update via REST for {trading_pair}.",
+                    )
+                    continue
+                if trades_response is None:
+                    self.logger().warning(f"Received None response when fetching REST trades for {trading_pair}.")
+                    continue
+
+                # Extract trades list safely
+                trades = []
+                if isinstance(trades_response, dict) and "trades" in trades_response:
+                    trades = trades_response.get("trades")  # Get trades list or None
+                elif isinstance(trades_response, list):  # Some APIs might return list directly
+                    trades = trades_response
+
+                if trades is None:  # Check explicitly for None if API might return it
+                    self.logger().debug(f"No trades found in REST response for {trading_pair}.")
+                    continue
+                if not isinstance(trades, list):
+                    self.logger().warning(f"Unexpected format for trades in REST response for {trading_pair}: {type(trades_response)}")
+                    continue
+
+                # Process each trade in the response
+                for trade_data in trades:
+                    if not isinstance(trade_data, dict):  # Ensure trade item is a dict
+                        self.logger().warning(f"Skipping invalid trade item (not a dict) for {trading_pair}: {trade_data}")
+                        continue
+
+                    exchange_order_id = str(trade_data.get("order_id", ""))
+                    if not exchange_order_id:
+                        continue  # Skip trades without order ID
+
+                    # Find corresponding tracked order (if any)
+                    tracked_order = tracked_orders_by_exchange_id.get(exchange_order_id)
+
+                    # Parse the trade using the helper
+                    parsed_result = self._parse_luno_trade_fill(trade_data, tracked_order)
+
+                    if parsed_result:
+                        exchange_trade_id, trade_update, order_filled_event = parsed_result
+
+                        if trade_update:
+                            # Fill belongs to an actively tracked order
+                            self.logger().info(f"Processing REST fill for tracked order {tracked_order.client_order_id} "
+                                               f"(Exch ID: {exchange_order_id}, Trade ID: {exchange_trade_id})")
+                            self._order_tracker.process_trade_update(trade_update)
+                        elif order_filled_event:
+                            # Fill belongs to a historical order found in DB
+                            self.logger().info(f"Processing REST fill for historical order "
+                                               f"(Exch ID: {exchange_order_id}, Trade ID: {exchange_trade_id})")
+                            self.trigger_event(MarketEvent.OrderFilled, order_filled_event)
+                            # _current_trade_fills is managed by the base class via is_confirmed_new_order_filled_event
+                            # self.logger().info(f"Recreating missing trade in TradeFill: {trade_data}") # Logging done in base class
+                        # else: Trade parsed but didn't match active or historical tracked order
+
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.logger().exception("Unexpected error occurred fetching order fills from trades.")
+
+    async def _all_trade_updates_for_order(self, order: InFlightOrder) -> List[TradeUpdate]:
+        """
+        Retrieves all trade fills associated with a specific InFlightOrder via REST API.
+
+        Uses the Luno '/trades' endpoint filtered by the order's exchange ID.
+
+        :param order: The InFlightOrder object for which to retrieve trade fills.
+        :return: A list of TradeUpdate objects representing the fills for the order.
+                 Returns an empty list if the order has no exchange ID or if fetching fails.
+        """
+        trade_updates: List[TradeUpdate] = []
+
+        # Ensure we have an exchange order ID to query
+        if order.exchange_order_id is None:
+            self.logger().warning(f"Cannot fetch trades for order {order.client_order_id}: Missing exchange_order_id.")
+            return trade_updates
+
+        try:
+            exchange_order_id = order.exchange_order_id
+            # Derive trading_pair symbol needed for the API call
+            exchange_symbol = await self.exchange_symbol_associated_to_pair(trading_pair=order.trading_pair)
+
+            # Fetch trades specific to this order ID using Luno's API
+            # Note: Luno's /trades endpoint doesn't directly filter by order ID.
+            # We need to fetch recent trades for the pair and then filter locally.
+            # This is less efficient than exchanges offering direct order trade history.
+            # Fetch a reasonable number of recent trades; adjust limit if needed.
+            params = {
+                "pair": exchange_symbol,
+                "limit": 100  # Fetch up to 100 recent trades for the pair
+            }
+            all_fills_response = await self._api_get(
+                path_url=CONSTANTS.TRADES_URL,
+                params=params,
+                is_auth_required=True,  # Requires authentication
+                limit_id=CONSTANTS.TRADES_URL  # Use appropriate rate limit ID
+            )
+
+            # --- Process the response ---
+            trades = []
+            if all_fills_response is None:
+                self.logger().warning(f"Received None response when fetching trades for pair {order.trading_pair} "
+                                      f"(while checking order {exchange_order_id}).")
+            elif isinstance(all_fills_response, dict) and "trades" in all_fills_response:
+                trades = all_fills_response.get("trades") or []  # Ensure list even if None/empty
+            elif isinstance(all_fills_response, list):  # Handle direct list response if API changes
+                trades = all_fills_response
+            else:
+                self.logger().warning(f"Unexpected response format when fetching trades for pair {order.trading_pair}: {type(all_fills_response)}")
+
+            # Filter trades belonging to the specific order ID and parse them
+            for trade_data in trades:
+                if not isinstance(trade_data, dict):
+                    continue  # Skip invalid items
+
+                # Filter trades based on the order_id provided in the trade data
+                if str(trade_data.get("order_id", "")) == exchange_order_id:
+                    # Use the parsing helper, passing the known tracked_order
+                    parsed_result = self._parse_luno_trade_fill(trade_data, order)
+                    if parsed_result:
+                        _ex_trade_id, trade_update, _order_filled_event = parsed_result
+                        # We only care about the TradeUpdate for the tracked order here
+                        if trade_update:
+                            trade_updates.append(trade_update)
+                        # We generally don't expect an OrderFilledEvent here as we passed a tracked_order
+
+            if not trade_updates:
+                self.logger().debug(f"No trade fills found via REST for order {order.client_order_id} (Exch ID: {exchange_order_id}).")
+            else:
+                self.logger().info(f"Fetched {len(trade_updates)} trade fills via REST for order {order.client_order_id} (Exch ID: {exchange_order_id}).")
+
+        except asyncio.CancelledError:
+            raise  # Propagate cancellation
+        except Exception as e:
+            self.logger().error(
+                f"Error fetching trades for order {order.client_order_id} (Exch ID: {order.exchange_order_id}): {e}",
+                exc_info=True
+            )
 
         return trade_updates
 
@@ -843,73 +900,62 @@ class LunoExchange(ExchangePyBase):
 
         # Extract order state from response
         status = updated_order_data.get("state", updated_order_data.get("status", ""))
-        new_state = CONSTANTS.ORDER_STATE.get(status, None)
+        new_state = CONSTANTS.ORDER_STATE.get(status, OrderState.PENDING_CREATE)
 
-        if new_state is None:
-            self.logger().warning(f"Unrecognized order status: {status} for {client_order_id}")
-            # Use a default state to avoid errors
-            new_state = OrderState.PENDING_CREATE
+        if status not in CONSTANTS.ORDER_STATE:
+            self.logger().warning(f"Unrecognized order status '{status}' for order {tracked_order.client_order_id}. Mapping to {new_state.name}.")
 
-        # Create OrderUpdate
         order_update = OrderUpdate(
-            client_order_id=client_order_id,
-            exchange_order_id=str(updated_order_data.get("order_id", exchange_order_id)),
+            client_order_id=tracked_order.client_order_id,
+            exchange_order_id=str(updated_order_data.get("order_id", tracked_order.exchange_order_id)),
             trading_pair=tracked_order.trading_pair,
-            update_timestamp=self._time_synchronizer.time(),  # Use current time as Luno doesn't provide update time
+            update_timestamp=self._time_synchronizer.time(),
             new_state=new_state,
         )
 
-        # If the order is complete, create a trade update to update the executed amount
-        if status == "COMPLETE" and tracked_order.executed_amount_base < tracked_order.amount:
-            # Create a trade update with the full order amount
-            trade_id = f"{exchange_order_id}_{self._time_synchronizer.time()}"
-            trade_update = TradeUpdate(
-                trade_id=trade_id,
-                client_order_id=client_order_id,
-                exchange_order_id=exchange_order_id,
-                trading_pair=tracked_order.trading_pair,
-                fee=DeductedFromReturnsTradeFee(),  # Use a default fee as we don't have fee info
-                fill_base_amount=tracked_order.amount - tracked_order.executed_amount_base,
-                fill_quote_amount=(tracked_order.amount - tracked_order.executed_amount_base) * tracked_order.price,
-                fill_price=tracked_order.price,
-                fill_timestamp=self._time_synchronizer.time(),
-            )
-            self._order_tracker.process_trade_update(trade_update)
-
         return order_update
 
-    async def get_account_balances(self):
-        """
-        Retrieves all account balances.
+    async def get_account_balances(self) -> Dict[str, Dict[str, Decimal]]:
+        """Retrieves all account balances in the standard Hummingbot format."""
+        balances: Dict[str, Dict[str, Decimal]] = {}
+        try:
+            account_info = await self._api_get(
+                path_url=CONSTANTS.ACCOUNTS_URL,
+                is_auth_required=True)
 
-        :return: A dictionary of all account balances, with asset names as keys and objects with 'available' and 'locked' properties as values.
-        """
-        from dataclasses import dataclass
+            for balance_entry in account_info.get("balance", []):
+                asset_name = balance_entry.get("asset")
+                if not asset_name:
+                    continue
 
-        @dataclass
-        class Balance:
-            available: Decimal
-            locked: Decimal
+                # Use safe Decimal conversion
+                total_balance = self._safe_decimal_convert(balance_entry.get("balance"))
+                reserved_balance = self._safe_decimal_convert(balance_entry.get("reserved"))
+                available_balance = total_balance - reserved_balance
 
-        # Fetch account balance information
-        account_info = await self._api_get(
-            path_url=CONSTANTS.ACCOUNTS_URL,
-            is_auth_required=True)
-
-        balances = {}
-
-        # Process balance entries
-        for balance_entry in account_info.get("balance", []):
-            asset_name = balance_entry.get("asset")
-            total_balance = Decimal(balance_entry.get("balance", "0"))
-            reserved_balance = Decimal(balance_entry.get("reserved", "0"))
-
-            balances[asset_name] = Balance(
-                available=total_balance,
-                locked=reserved_balance
-            )
+                balances[asset_name] = {
+                    "total_balance": total_balance,
+                    "available_balance": available_balance
+                }
+        except Exception:
+            self.logger().exception("Error fetching account balances.")
+            # Return potentially stale balances from _account_balances if needed, or empty
+            # Reconstruct from internal state as fallback:
+            for asset, total in self._account_balances.items():
+                available = self._account_available_balances.get(asset, Decimal("0"))
+                balances[asset] = {"total_balance": total, "available_balance": available}
 
         return balances
+
+    @staticmethod
+    def _safe_decimal_convert(value: Optional[Any]) -> Decimal:
+        """Safely converts a value to Decimal, returning 0 for None or errors."""
+        if value is None:
+            return Decimal("0")
+        try:
+            return Decimal(str(value))
+        except (ValueError, TypeError, InvalidOperation):
+            return Decimal("0")
 
     async def _update_balances(self):
         """
@@ -1006,7 +1052,12 @@ class LunoExchange(ExchangePyBase):
 
         # Get the most recent trade (first in the list)
         most_recent_trade = trades[0]
-        last_price = Decimal(str(most_recent_trade.get("price", "0")))
+        price = most_recent_trade.get("price")
+        # Handle None values to prevent TypeError
+        if price is None:
+            self.logger().warning(f"No price found in most recent trade for {trading_pair}. Returning 0.")
+            return Decimal("0")
+        last_price = Decimal(str(price))
         return last_price
 
     def get_price_for_volume(self, trading_pair: str, is_buy: bool, volume: Decimal):
@@ -1100,15 +1151,31 @@ class LunoExchange(ExchangePyBase):
             quote_volume  # result_volume
         )
 
-    def get_order_book(self, trading_pair: str) -> OrderBook:
+    async def ensure_order_book_ready(self, trading_pair: str, timeout: float = 60.0) -> bool:
+        """Wait until the order book is ready."""
+        try:
+            if not self.order_book_tracker.ready:
+                await asyncio.wait_for(self.order_book_tracker.wait_ready(), timeout=timeout)
+            if trading_pair not in self.order_book_tracker.order_books:
+                self.logger().warning(f"Order book for {trading_pair} not found, initializing...")
+                # Force initialization if missing
+                await self.order_book_tracker.order_books_initialized.wait()
+            return trading_pair in self.order_book_tracker.order_books
+        except asyncio.TimeoutError:
+            self.logger().warning(f"Order book for {trading_pair} not ready after {timeout}s")
+            return False
+
+    def get_order_book(self, trading_pair: str) -> LunoOrderBook:
         """
         Returns the current order book for a particular market.
         :param trading_pair: the pair of tokens for which the order book should be retrieved
         :return: OrderBook for the specified trading pair
         """
+        asyncio.ensure_future(self.ensure_order_book_ready(trading_pair))
+
         if trading_pair not in self.order_book_tracker.order_books:
             raise ValueError(f"No order book exists for '{trading_pair}'.")
-        return self.order_book_tracker.order_books[trading_pair]
+        return cast(LunoOrderBook, self.order_books[trading_pair])
 
     def quantize_order_price(self, trading_pair: str, price: Decimal) -> Decimal:
         """
