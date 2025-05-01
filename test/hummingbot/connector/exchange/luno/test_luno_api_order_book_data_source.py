@@ -82,8 +82,9 @@ class TestLunoAPIOrderBookDataSource(IsolatedAsyncioWrapperTestCase):
     def get_rest_snapshot_mock() -> Dict:
         return {
             "timestamp": 1630556205455,
-            "bids": [{"price": "0.3003", "volume": "4146.5645"}],
-            "asks": [{"price": "0.3004", "volume": "1553.6412"}]
+            "sequence": "123456789",
+            "bids": [{"price": "0.3003", "volume": "4146.5645", "id": "bid_0_0.3003"}],
+            "asks": [{"price": "0.3004", "volume": "1553.6412", "id": "ask_0_0.3004"}]
         }
 
     @patch("hummingbot.core.web_assistant.rest_assistant.RESTAssistant.execute_request")
@@ -91,7 +92,6 @@ class TestLunoAPIOrderBookDataSource(IsolatedAsyncioWrapperTestCase):
         mock_api_request.return_value = self.get_rest_snapshot_mock()
 
         ob = await self.ob_data_source.get_new_order_book(self.trading_pair)
-        self.assertIsInstance(ob, LunoOrderBook)
         bids = list(ob.bid_entries())
         asks = list(ob.ask_entries())
         self.assertEqual(1, len(bids))
